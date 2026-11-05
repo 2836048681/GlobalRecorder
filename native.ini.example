@@ -1,0 +1,5 @@
+; Reference only. The application writes native.ini in UTF-16.
+; Add these keys to the existing [recorder] section; preserve its encoding.
+[recorder]
+asr_python=.venv-asr\Scripts\pythonw.exe
+asr_model=models\faster-whisper-small

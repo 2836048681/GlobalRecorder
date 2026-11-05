@@ -1,0 +1,3 @@
+# Optional ASR worker only; the C++ recorder has no Python dependency.
+# Direct dependency pinned; transitive dependencies are resolved by pip.
+faster-whisper==1.2.1

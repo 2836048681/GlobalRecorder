@@ -1,0 +1,49 @@
+{
+  "date": "2026-11-05",
+  "platform": "Windows x86_64",
+  "compiler": "Zig 0.15.2",
+  "binarySha256": "0F81348C227C57D775EAABF21A36CA01D6F142A03697E10D24CE9E4826586AF8",
+  "nativeModes": [
+    {
+      "mode": "--self-test",
+      "exit": 0
+    },
+    {
+      "mode": "--config-test",
+      "exit": 0
+    },
+    {
+      "mode": "--window-test",
+      "exit": 0
+    },
+    {
+      "mode": "--dock-test",
+      "exit": 0
+    }
+  ],
+  "window": {
+    "passed": true,
+    "checks": 100,
+    "failedChecks": []
+  },
+  "dock": {
+    "passed": true,
+    "hiddenWindowOnly": true,
+    "checks": 95,
+    "failedChecks": []
+  },
+  "configuration": {
+    "passed": true,
+    "portableAsrPaths": true,
+    "processLoopbackSupported": true
+  },
+  "asrBridgeTests": {
+    "passed": 13,
+    "realModel": false,
+    "audioDevices": false
+  },
+  "offscreenRender": true,
+  "realAudioDeviceTest": "NOT_RUN",
+  "realWechatCallTest": "NOT_RUN",
+  "desktopInputAutomation": false
+}

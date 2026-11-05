@@ -1,0 +1,44 @@
+# Build outputs and local compiler
+native-bin/
+work/
+dist/
+*.exe
+*.pdb
+*.obj
+.zig-cache/
+zig-out/
+
+# Local Python environments and model weights
+.venv*/
+venv/
+models/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Private audio, transcripts, sessions and settings
+recordings/
+runtime/
+native.ini
+native-control.json
+native-asr-status.json
+native-session-queue.txt
+*.native-tmp
+*.job
+*.wav
+*.flac
+*.mp3
+*.jsonl
+*.log
+**/轻量_*/
+**/转写.txt
+.env
+.env.*
+*.lnk
+
+# Editor settings
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
