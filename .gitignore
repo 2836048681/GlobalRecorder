@@ -24,6 +24,7 @@ native.ini
 native-control.json
 native-asr-status.json
 native-session-queue.txt
+native-setup-status.ini
 *.native-tmp
 *.job
 *.wav

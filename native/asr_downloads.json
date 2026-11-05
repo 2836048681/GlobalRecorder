@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "verifiedAt": "2026-11-05",
+  "sources": {
+    "python": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip.sigstore",
+    "pythonHashNote": "Original embed-amd64.zip digest from official Sigstore messageSignature.messageDigest (base64 decoded). windows-3.11.9.json describes a DIFFERENT repackaged embeddable-amd64.zip; do not mix their hashes.",
+    "pip": "https://pypi.org/pypi/pip/25.0.1/json",
+    "fasterWhisper": "https://pypi.org/pypi/faster-whisper/1.2.1/json",
+    "huggingFaceTree": "https://huggingface.co/api/models/Systran/faster-whisper-tiny/tree/d90ca5fe260221311c53c58e660288d3deb8d356?recursive=true&expand=true",
+    "metadataSha256": "https://modelscope.cn/api/v1/models/Systran/faster-whisper-tiny/repo/files?Revision=9530ee785810b90b6e14e404dea7806b56518394&Recursive=true",
+    "metadataHashNote": "tokenizer/vocabulary SHA256 come from ModelScope file metadata, corroborated by pengzhendong/faster-whisper-tiny metadata. Official HF Git blob SHA1 and sizes are ALSO enforced. No tokenizer, vocabulary, wheel or model binary was downloaded during development.",
+    "preprocessor": "https://huggingface.co/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af/preprocessor_config.json",
+    "preprocessorNote": "Systran's tiny repository has no preprocessor_config.json. Use the pinned multilingual openai/whisper-tiny configuration (80 mel bins), with its own hash and revision.",
+    "tunaHelp": "https://mirrors.tuna.tsinghua.edu.cn/help/pypi/",
+    "hfMirrorHelp": "https://hf-mirror.com/",
+    "pythonMirror": "https://mirrors.huaweicloud.com/python/3.11.9/"
+  },
+  "python": {
+    "name": "python-3.11.9-embed-amd64.zip",
+    "sha256": "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b",
+    "size": 11249023,
+    "urls": [
+      "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-embed-amd64.zip",
+      "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip"
+    ]
+  },
+  "pip": {
+    "name": "pip-25.0.1-py3-none-any.whl",
+    "sha256": "c46efd13b6aa8279f33f2864459c8ce587ea6a1a59ee20de055868d8f7688f7f",
+    "urls": [
+      "https://pypi.tuna.tsinghua.edu.cn/packages/c9/bc/b7db44f5f39f9d0494071bddae6880eb645970366d0a200022a1a93d57f5/pip-25.0.1-py3-none-any.whl",
+      "https://files.pythonhosted.org/packages/c9/bc/b7db44f5f39f9d0494071bddae6880eb645970366d0a200022a1a93d57f5/pip-25.0.1-py3-none-any.whl"
+    ]
+  },
+  "fasterWhisper": {
+    "name": "faster_whisper-1.2.1-py3-none-any.whl",
+    "sha256": "79a66ad50688c0b794dd501dc340a736992a6342f7f95e5811be60b5224a26a7",
+    "urls": [
+      "https://pypi.tuna.tsinghua.edu.cn/packages/05/99/49ee85903dee060d9f08297b4a342e5e0bcfca2f027a07b4ee0a38ab13f9/faster_whisper-1.2.1-py3-none-any.whl",
+      "https://files.pythonhosted.org/packages/05/99/49ee85903dee060d9f08297b4a342e5e0bcfca2f027a07b4ee0a38ab13f9/faster_whisper-1.2.1-py3-none-any.whl"
+    ]
+  },
+  "pipIndexes": [
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://repo.huaweicloud.com/repository/pypi/simple",
+    "https://pypi.org/simple"
+  ],
+  "modelRevision": "d90ca5fe260221311c53c58e660288d3deb8d356",
+  "modelFiles": [
+    {
+      "name": "config.json",
+      "size": 2249,
+      "sha256": "a73a28cdfe1c43ccc7202fa333d1f89c202477271407ae9a7f19afa52039cac8",
+      "gitBlob": "3baa18e2b321a2f489614607852a729fcd516480",
+      "urls": [
+        "https://hf-mirror.com/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/config.json",
+        "https://huggingface.co/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/config.json"
+      ]
+    },
+    {
+      "name": "model.bin",
+      "size": 75538270,
+      "sha256": "dcb76c6586fc06cbdac6dd21f14cfd129cc4cdd9dce19bf4ffa62e59cbe6e6d1",
+      "urls": [
+        "https://hf-mirror.com/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/model.bin",
+        "https://huggingface.co/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/model.bin"
+      ]
+    },
+    {
+      "name": "tokenizer.json",
+      "size": 2203239,
+      "sha256": "fb7b63191e9bb045082c79fd742a3106a12c99513ab30df4a0d47fa6cb6fd0ab",
+      "gitBlob": "7818adb6de9fa3064d3ff81226fdd675be1f6344",
+      "urls": [
+        "https://hf-mirror.com/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/tokenizer.json",
+        "https://huggingface.co/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/tokenizer.json"
+      ]
+    },
+    {
+      "name": "vocabulary.txt",
+      "size": 459861,
+      "sha256": "34ce3fe1c5041027b3f8d42912270993f986dbc4bb34cf27f951e34a1e453913",
+      "gitBlob": "c9074644d9d1205686f16d411564729461324b75",
+      "urls": [
+        "https://hf-mirror.com/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/vocabulary.txt",
+        "https://huggingface.co/Systran/faster-whisper-tiny/resolve/d90ca5fe260221311c53c58e660288d3deb8d356/vocabulary.txt"
+      ]
+    },
+    {
+      "name": "preprocessor_config.json",
+      "size": 184990,
+      "sha256": "9b5cd03a36fbb8a627c64d98a5b5b126ead95a77720723944487311f0110b666",
+      "gitBlob": "c2048dfa9fd94a052e62e908d2c4dfb18534b4d2",
+      "urls": [
+        "https://hf-mirror.com/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af/preprocessor_config.json",
+        "https://huggingface.co/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af/preprocessor_config.json"
+      ]
+    }
+  ]
+}

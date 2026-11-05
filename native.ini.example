@@ -3,3 +3,6 @@
 [recorder]
 asr_python=.venv-asr\Scripts\pythonw.exe
 asr_model=models\faster-whisper-small
+; Prompt before recording when QQ/WeChat microphone activity is detected.
+call_prompt_mode=1
+call_watch_messaging=1

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <cwctype>
+#include <memory>
 #include "audio.h"
 #include "shell_support.h"
 
@@ -35,21 +36,23 @@ const Color accent(255,194,225,222), danger(255,244,117,118);
 }
 enum { Folder = 101, OpenFolder, ShowText, HideWindow, ExitApp,
        CallOff, CallAsk, CallAuto, Retry, ShowWindowCmd, ScopeGlobal, ScopeProgram, EditHotkeys, ToggleStartup,
-       ResetCloseAction };
+       ResetCloseAction, MessagingCalls };
 HWND window = nullptr, transcript = nullptr, edit = nullptr;
 fs::path project, config, root, session, activeRoot, model, python;
 fs::path diagnosticFrame;
 lightrec::Recorder recorder;
 bool enabled = false, paused = false, expanded = false, diagnostic = false;
 bool quitWhenSaved = false, hotkeyR = false, hotkeyT = false;
-int callMode = 0, callHits = 0, hover = -1, pressed = -1, benchTicks = 0;
-bool callLatched = false, previewRecording = false;
+int callMode = 1, hover = -1, pressed = -1, benchTicks = 0;
+bool messagingCalls = true, previewRecording = false;
 bool programOnly = false;
 bool sessionProgramOnly = false;
 std::wstring targetExe;
 std::wstring sessionTarget;
 DWORD preferredPid = 0;
 HANDLE asr = nullptr, asrJob = nullptr, instanceMutex = nullptr;
+HANDLE setupProcess=nullptr, setupJob=nullptr;
+bool setupEnableRequested=false;
 std::vector<fs::path> sessionQueue;
 std::wstring note, transcriptCache;
 float dpi = 1;
@@ -76,17 +79,52 @@ bool dockCollapsed=false, dragPending=false, dragging=false;
 bool dockAnimating=false, dockHiding=false, dockHoverArmed=true;
 float dockReveal=1, dockAnimationFrom=1;
 ULONGLONG dockAnimationStart=0;
+bool dockTimerResolution=false;
+std::unique_ptr<Bitmap> dockScene;
+struct HudSurface {
+    HDC dc=nullptr; HBITMAP bitmap=nullptr; HGDIOBJ original=nullptr;
+    void* pixels=nullptr; int width=0,height=0,allocations=0;
+    bool ensure(int w,int h) {
+        if(bitmap&&width==w&&height==h) return true;
+        if(!dc) dc=CreateCompatibleDC(nullptr);
+        if(!dc) return false;
+        BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth=w; info.bmiHeader.biHeight=-h;
+        info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
+        info.bmiHeader.biCompression=BI_RGB;
+        void* nextPixels=nullptr;
+        HBITMAP next=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&nextPixels,nullptr,0);
+        if(!next) return false;
+        HGDIOBJ previous=SelectObject(dc,next);
+        if(!original) original=previous;
+        if(bitmap) DeleteObject(bitmap);
+        bitmap=next; pixels=nextPixels; width=w; height=h; ++allocations;
+        return true;
+    }
+    void release() {
+        if(dc&&original) SelectObject(dc,original);
+        if(bitmap) DeleteObject(bitmap);
+        if(dc) DeleteDC(dc);
+        dc=nullptr; bitmap=nullptr; original=nullptr; pixels=nullptr; width=height=0;
+    }
+    ~HudSurface() { release(); }
+} hudSurface;
 ULONGLONG outsideSince=0;
 int interactionDepth=0;
 enum class CloseAction { Ask, Tray, Exit };
 CloseAction closeAction=CloseAction::Ask;
 HWND closeDialog=nullptr;
 HFONT closeFont=nullptr;
-bool closeExitOnly=false, closeIssue=false;
+bool closeExitOnly=false, closeCallPrompt=false, closeSetupPrompt=false, closeIssue=false;
+std::wstring closeCallName;
+int diagnosticCallAccepts=0;
 float closeScale=1;
 void expandDock(bool animate=false);
 void requestExit(bool confirmed=false);
-void showCloseChoice(bool exitOnly=false);
+void showCloseChoice(bool exitOnly=false,const std::wstring& callName=L"",bool setupPrompt=false);
+void resetCallGates();
+void beginAsrSetup();
+void toggleTranscription();
 
 std::vector<Program> runningPrograms() {
     std::vector<Program> result;
@@ -202,6 +240,21 @@ void locateModel() {
     model = localPath(ini(L"asr_model"), L"models/faster-whisper-small");
     if (!fs::exists(model / L"model.bin") || !fs::exists(model / L"config.json"))
         model.clear();
+    fs::path ready=project/L"runtime/asr-ready.ini";
+    auto installed=[&](const wchar_t* key) {
+        std::vector<wchar_t> value(32768);
+        GetPrivateProfileStringW(L"asr",key,L"",value.data(),(DWORD)value.size(),ready.c_str());
+        return value[0]?localPath(value.data(),fs::path{}):fs::path{};
+    };
+    if(!fs::exists(python)) {
+        fs::path candidate=installed(L"python");
+        if(!candidate.empty()&&fs::exists(candidate)) python=candidate;
+    }
+    if(model.empty()) {
+        fs::path candidate=installed(L"model");
+        if(!candidate.empty()&&fs::exists(candidate/L"model.bin")&&fs::exists(candidate/L"config.json"))
+            model=candidate;
+    }
 }
 void pollAsr() {
     if (!asr || WaitForSingleObject(asr, 0) != WAIT_OBJECT_0) return;
@@ -283,6 +336,84 @@ void chunkReady(const lightrec::Chunk& c) {
          << ",\"start\":" << std::fixed << std::setprecision(3) << c.start
          << ",\"duration\":" << c.duration << ",\"status\":\"pending\"}";
     if (!atomicText(path, text.str())) throw std::runtime_error("Cannot save transcription job");
+}
+bool localAsrReady() {
+    return !python.empty()&&fs::exists(python)&&!model.empty()&&
+        fs::exists(model/L"model.bin")&&fs::exists(model/L"config.json");
+}
+void beginAsrSetup() {
+    if(diagnostic) return;
+    if(setupProcess) { note=L"正在准备转写组件，请稍候"; return; }
+    fs::path script=project/L"native/install_asr.ps1";
+    if(!fs::exists(script)) { note=L"缺少转写安装脚本，请完整解压程序包"; return; }
+    wchar_t system[32768]{}; GetSystemDirectoryW(system,32768);
+    fs::path shell=fs::path(system)/L"WindowsPowerShell/v1.0/powershell.exe";
+    fs::path status=project/L"native-setup-status.ini";
+    DeleteFileW(status.c_str());
+    std::wstring cmd=quote(shell.wstring())+L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "+
+        quote(script.wstring())+L" -ProjectRoot "+quote(project.wstring())+
+        L" -StatusPath "+quote(status.wstring());
+    // Empty quoted PowerShell arguments are ambiguous with the script parameter binder.
+    if(!python.empty()&&fs::exists(python)) cmd+=L" -ExistingPython "+quote(python.wstring());
+    if(!model.empty()) cmd+=L" -ExistingModel "+quote(model.wstring());
+    STARTUPINFOW si{sizeof(si)}; PROCESS_INFORMATION pi{};
+    if(!CreateProcessW(shell.c_str(),cmd.data(),nullptr,nullptr,FALSE,
+        CREATE_NO_WINDOW|CREATE_SUSPENDED,nullptr,project.c_str(),&si,&pi)) {
+        note=L"无法启动下载，请检查程序目录权限"; return;
+    }
+    setupJob=CreateJobObjectW(nullptr,nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if(!setupJob||!SetInformationJobObject(setupJob,JobObjectExtendedLimitInformation,&limits,sizeof(limits))||
+       !AssignProcessToJobObject(setupJob,pi.hProcess)) {
+        TerminateProcess(pi.hProcess,3); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        if(setupJob) CloseHandle(setupJob); setupJob=nullptr;
+        note=L"无法创建独立下载任务"; return;
+    }
+    setupEnableRequested=true;
+    setupProcess=pi.hProcess; ResumeThread(pi.hThread); CloseHandle(pi.hThread);
+    note=L"正在从国内镜像准备转写组件…";
+}
+void pollAsrSetup() {
+    if(!setupProcess) return;
+    fs::path status=project/L"native-setup-status.ini";
+    wchar_t message[512]{},state[64]{};
+    GetPrivateProfileStringW(L"setup",L"message",L"",message,512,status.c_str());
+    GetPrivateProfileStringW(L"setup",L"state",L"",state,64,status.c_str());
+    note=message[0]?message:L"正在准备本地转写…";
+    if(WaitForSingleObject(setupProcess,0)!=WAIT_OBJECT_0) return;
+    DWORD code=1; GetExitCodeProcess(setupProcess,&code);
+    CloseHandle(setupProcess); setupProcess=nullptr;
+    if(setupJob) CloseHandle(setupJob); setupJob=nullptr;
+    locateModel();
+    bool installed=false;
+    if(code==0&&_wcsicmp(state,L"ready")==0) {
+        fs::path manifest=project/L"runtime/asr-ready.ini";
+        wchar_t interpreter[32768]{},weights[32768]{};
+        GetPrivateProfileStringW(L"asr",L"python",L"",interpreter,32768,manifest.c_str());
+        GetPrivateProfileStringW(L"asr",L"model",L"",weights,32768,manifest.c_str());
+        if(interpreter[0]&&weights[0]&&fs::exists(interpreter)&&
+           fs::exists(fs::path(weights)/L"model.bin")&&fs::exists(fs::path(weights)/L"config.json")) {
+            python=interpreter; model=weights; installed=true;
+            setting(L"asr_python",python.wstring()); setting(L"asr_model",model.wstring());
+        }
+    }
+    if(installed&&localAsrReady()) {
+        if(setupEnableRequested) { enabled=true; paused=false; flags(); startAsr(); }
+        note=L"本地转写已就绪";
+    } else {
+        enabled=false; flags();
+        if(_wcsicmp(state,L"error")!=0||!message[0])
+            note=L"下载未完成，点击转写可重试；录音照常";
+    }
+    setupEnableRequested=false;
+}
+void toggleTranscription() {
+    if(enabled) { enabled=false; setupEnableRequested=false; flags(); note.clear(); return; }
+    if(setupProcess) { note=L"正在下载转写组件，请稍候"; return; }
+    locateModel();
+    if(!localAsrReady()) { showCloseChoice(false,L"",true); return; }
+    enabled=true; paused=false; flags(); note.clear(); startAsr();
 }
 void recordToggle() {
     if (diagnostic) return;
@@ -390,7 +521,7 @@ void paint(Graphics& g) {
     SolidBrush pillFill(on ? Color(34,170,219,208) : Color(16,214,230,236));
     g.FillPath(&pillFill,&pill);
     if (hover==1) { Pen border(Color(100,190,220,217),1); g.DrawPath(&border,&pill); }
-    text(g,on?L"转写 开":L"转写 关",269,43,56,30,11,
+    text(g,setupProcess?L"下载中":on?L"转写 开":L"转写 关",269,43,56,30,11,
          on?Color(255,190,225,218):Color(255,165,180,189));
     Color utility = on ? Color(255,199,214,222):Color(105,164,180,190);
     Pen pausePen(utility,2);
@@ -461,26 +592,22 @@ void redraw() {
     bool vertical=dockEdge==DockEdge::Left||dockEdge==DockEdge::Right;
     int w=(int)((dockCollapsed?(vertical?24:48):W)*dpi);
     int h=(int)((dockCollapsed?(vertical?48:24):H)*dpi);
-    HDC screen=GetDC(nullptr), memory=CreateCompatibleDC(screen);
-    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth=w; bi.bmiHeader.biHeight=-h;
-    bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
-    void* pixels=nullptr;
-    HBITMAP dib=CreateDIBSection(screen,&bi,DIB_RGB_COLORS,&pixels,nullptr,0);
-    if (!dib) { DeleteDC(memory); ReleaseDC(nullptr,screen); return; }
-    HGDIOBJ previous=SelectObject(memory,dib);
+    if(!hudSurface.ensure(w,h)) return;
     {
-        Bitmap bitmap(w,h,w*4,PixelFormat32bppPARGB,(BYTE*)pixels);
+        Bitmap bitmap(w,h,w*4,PixelFormat32bppPARGB,(BYTE*)hudSurface.pixels);
         Graphics g(&bitmap); g.ScaleTransform(dpi,dpi);
         if(dockCollapsed) {
             g.Clear(Color(0,0,0,0)); paintDockTab(g,dockEdge);
         } else if(dockAnimating) {
+            g.Clear(Color(0,0,0,0));
             float offset=1-dockReveal;
-            auto state=g.Save();
-            g.TranslateTransform(dockEdge==DockEdge::Left?-W*offset:
-                dockEdge==DockEdge::Right?W*offset:0,
-                dockEdge==DockEdge::Top?-H*offset:dockEdge==DockEdge::Bottom?H*offset:0);
-            paint(g); g.Restore(state);
+            float dx=dockEdge==DockEdge::Left?-W*offset:dockEdge==DockEdge::Right?W*offset:0;
+            float dy=dockEdge==DockEdge::Top?-H*offset:dockEdge==DockEdge::Bottom?H*offset:0;
+            dx=std::round(dx*dpi)/dpi; dy=std::round(dy*dpi)/dpi;
+            if(dockScene) {
+                g.SetInterpolationMode(InterpolationModeNearestNeighbor);
+                g.DrawImage(dockScene.get(),RectF(dx,dy,(REAL)W,(REAL)H));
+            }
             // Render the badge at the same physical anchor it occupies when collapsed.
             LONG bw=(LONG)((vertical?24:48)*dpi),bh=(LONG)((vertical?48:24)*dpi);
             LONG bx=std::clamp((dockExpanded.left+dockExpanded.right-bw)/2,
@@ -500,8 +627,7 @@ void redraw() {
         }
     }
     SIZE size{w,h}; POINT src{}; BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
-    UpdateLayeredWindow(window,screen,nullptr,&size,memory,&src,0,&blend,ULW_ALPHA);
-    SelectObject(memory,previous); DeleteObject(dib); DeleteDC(memory); ReleaseDC(nullptr,screen);
+    UpdateLayeredWindow(window,nullptr,nullptr,&size,hudSurface.dc,&src,0,&blend,ULW_ALPHA);
 }
 DockEdge edgeNear(const RECT& rect,const RECT& area,float scale) {
     LONG threshold=(LONG)std::lround(24*scale);
@@ -559,8 +685,13 @@ void placeHud(const RECT& rect) {
                  SWP_NOZORDER|SWP_NOACTIVATE);
     redraw();
 }
+void stopDockTimer() {
+    KillTimer(window,3);
+    if(dockTimerResolution) { timeEndPeriod(1); dockTimerResolution=false; }
+}
 void finishDockAnimation() {
-    KillTimer(window,3); dockAnimating=false; dockReveal=dockHiding?0.f:1.f;
+    stopDockTimer(); dockAnimating=false; dockReveal=dockHiding?0.f:1.f;
+    dockScene.reset();
     dockCollapsed=dockHiding;
     if(dockCollapsed) {
         placeHud(tabBounds(dockExpanded,dockArea,dpi,dockEdge));
@@ -585,7 +716,11 @@ bool dockAnimationAllowed() {
     return enabled!=FALSE;
 }
 void beginDockAnimation(bool hiding) {
+    // Rasterize text and geometry once; moving frames only compose the cached scene.
+    dockScene=std::make_unique<Bitmap>((int)(W*dpi),(int)(H*dpi),PixelFormat32bppPARGB);
+    { Graphics scene(dockScene.get()); scene.ScaleTransform(dpi,dpi); paint(scene); scene.Flush(); }
     dockAnimationFrom=dockReveal; dockHiding=hiding; dockAnimating=true;
+    if(!diagnostic&&!dockTimerResolution) dockTimerResolution=timeBeginPeriod(1)==TIMERR_NOERROR;
     dockAnimationStart=GetTickCount64(); SetTimer(window,3,16,nullptr); redraw();
 }
 void expandDock(bool animate) {
@@ -596,7 +731,7 @@ void expandDock(bool animate) {
         dockCollapsed=false; hover=pressed=-1;
         beginDockAnimation(false); placeHud(dockExpanded); return;
     }
-    KillTimer(window,3); dockAnimating=dockCollapsed=false; dockReveal=1;
+    stopDockTimer(); dockScene.reset(); dockAnimating=dockCollapsed=false; dockReveal=1;
     hover=pressed=-1; placeHud(dockExpanded);
 }
 void collapseDock(bool animate=false) {
@@ -681,7 +816,7 @@ void selectedProgram(const std::wstring& path,DWORD pid) {
     }
     setting(L"preferred_pid",std::to_wstring(pid));
     targetExe=path; preferredPid=pid; programOnly=true;
-    callHits=0; callLatched=false;
+    resetCallGates();
     note=busy()?L"监听范围已记住 · 下一次录音生效":L"已选择 "+fs::path(path).filename().wstring();
 }
 void layoutPicker(HWND hwnd) {
@@ -799,33 +934,71 @@ void showText() {
     }
     expanded=true; updateText(); ShowWindow(transcript,SW_SHOW); SetForegroundWindow(transcript);
 }
-bool monitoredActive() {
+enum class CallApp { None, WeChat, QQ, Selected };
+CallApp messagingApp(const fs::path& path) {
+    std::wstring name=path.filename().wstring();
+    if(_wcsicmp(name.c_str(),L"WeChat.exe")==0||_wcsicmp(name.c_str(),L"Weixin.exe")==0)
+        return CallApp::WeChat;
+    if(_wcsicmp(name.c_str(),L"QQ.exe")==0||_wcsicmp(name.c_str(),L"QQNT.exe")==0)
+        return CallApp::QQ;
+    return CallApp::None;
+}
+bool watchedCallPath(const std::wstring& path,bool selected,const std::wstring& target,bool messaging) {
+    return (!selected||_wcsicmp(path.c_str(),target.c_str())==0)&&
+        (!messaging||messagingApp(path)!=CallApp::None);
+}
+struct CallGate {
+    bool observing=false,latched=false,quiet=false;
+    ULONGLONG activeSince=0,quietSince=0;
+    bool update(bool active,ULONGLONG now) {
+        if(!active) {
+            observing=false;
+            if(!quiet) { quiet=true; quietSince=now; }
+            if(now-quietSince>=8000) latched=false;
+            return false;
+        }
+        quiet=false;
+        if(!observing) { observing=true; activeSince=now; }
+        if(!latched&&now-activeSince>=2500) { latched=true; return true; }
+        return false;
+    }
+};
+CallGate callGates[3];
+void resetCallGates() { for(auto& gate:callGates) gate=CallGate{}; }
+struct CallActivity { bool active[3]{}; std::wstring label[3]; };
+CallActivity monitoredActivity() {
     IMMDeviceEnumerator* enumerator=nullptr; IMMDeviceCollection* devices=nullptr;
-    bool found=false;
+    CallActivity result;
     if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,
                                   IID_PPV_ARGS(&enumerator))) &&
        SUCCEEDED(enumerator->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&devices))) {
       UINT deviceCount=0; devices->GetCount(&deviceCount);
-      for(UINT index=0;index<deviceCount&&!found;++index) {
+      for(UINT index=0;index<deviceCount;++index) {
        IMMDevice* device=nullptr; IAudioSessionManager2* manager=nullptr;
        IAudioSessionEnumerator* sessions=nullptr;
        if(SUCCEEDED(devices->Item(index,&device)) &&
           SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager2),CLSCTX_ALL,nullptr,(void**)&manager)) &&
           SUCCEEDED(manager->GetSessionEnumerator(&sessions))) {
         int count=0; sessions->GetCount(&count);
-        for(int i=0;i<count&&!found;++i) {
+        for(int i=0;i<count;++i) {
             IAudioSessionControl* control=nullptr; IAudioSessionControl2* detail=nullptr;
             if(SUCCEEDED(sessions->GetSession(i,&control))) {
                 AudioSessionState state; DWORD pid=0;
                 if(SUCCEEDED(control->GetState(&state)) && state==AudioSessionStateActive &&
                    SUCCEEDED(control->QueryInterface(IID_PPV_ARGS(&detail))) &&
                    SUCCEEDED(detail->GetProcessId(&pid))) {
-                    if(!programOnly && pid!=GetCurrentProcessId() && pid!=0) found=true;
-                    HANDLE process=programOnly?OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid):nullptr;
+                    HANDLE process=pid&&pid!=GetCurrentProcessId()?
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid):nullptr;
                     if(process) {
                         wchar_t path[32768]; DWORD length=32768;
                         if(QueryFullProcessImageNameW(process,0,path,&length)) {
-                            found=_wcsicmp(path,targetExe.c_str())==0;
+                            if(watchedCallPath(path,programOnly,targetExe,messagingCalls)) {
+                                CallApp app=messagingApp(path);
+                                int slot=messagingCalls?(app==CallApp::WeChat?0:1):2;
+                                result.active[slot]=true;
+                                result.label[slot]=messagingCalls?(slot==0?L"微信":L"QQ"):
+                                    programOnly?fs::path(targetExe).filename().wstring():L"应用";
+                            }
                         }
                         CloseHandle(process);
                     }
@@ -839,18 +1012,19 @@ bool monitoredActive() {
       }
     }
     if(devices) devices->Release(); if(enumerator) enumerator->Release();
-    return found;
+    return result;
 }
 void checkCall() {
-    if(!callMode || diagnostic || picker || hotkeyDialog) return;
-    bool active=monitoredActive();
-    if(!active) { callHits=0; callLatched=false; return; }
-    if(++callHits<3 || callLatched) return;
-    callLatched=true;
-    if(busy()) return;
-    if(callMode==2 || MessageBoxW(window,
-        L"检测到监听范围内的程序正在使用麦克风，是否开始录音？\n语音消息、语音输入也可能触发此提示。",
-        L"全局录音",MB_YESNO|MB_ICONQUESTION)==IDYES) recordToggle();
+    if(!callMode||diagnostic||picker||hotkeyDialog||closeDialog||interactionDepth||dockAnimating||
+       dragPending||dragging||!IsWindowEnabled(window)) return;
+    auto activity=monitoredActivity();
+    ULONGLONG now=GetTickCount64();
+    for(int i=0;i<3;++i) {
+        if(!callGates[i].update(activity.active[i],now)||busy()) continue;
+        if(callMode==2) recordToggle();
+        else showCloseChoice(false,activity.label[i]);
+        break;
+    }
 }
 bool sameKey(Shortcut a,Shortcut b) { return a.key==b.key&&a.modifiers==b.modifiers; }
 bool validKey(Shortcut value) {
@@ -1203,8 +1377,12 @@ void layoutClose(HWND hwnd) {
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     for(const auto& item:items) {
         HWND child=GetDlgItem(hwnd,item.id);
-        int y=closeExitOnly&&(item.id==702||item.id==IDCANCEL)?136:item.y;
-        MoveWindow(child,(int)(item.x*scale),(int)(y*scale),(int)(item.w*scale),(int)(item.h*scale),TRUE);
+        bool question=closeCallPrompt||closeSetupPrompt;
+        int y=(closeExitOnly&&(item.id==702||item.id==IDCANCEL))||
+            (question&&(item.id==701||item.id==IDCANCEL))?136:item.y;
+        int x=question&&item.id==IDCANCEL?264:item.x;
+        int width=question&&item.id==IDCANCEL?136:item.w;
+        MoveWindow(child,(int)(x*scale),(int)(y*scale),(int)(width*scale),(int)(item.h*scale),TRUE);
         SendMessageW(child,WM_SETFONT,(WPARAM)next,TRUE);
     }
     if(closeFont) DeleteObject(closeFont); closeFont=next;
@@ -1220,7 +1398,7 @@ LRESULT CALLBACK closeProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         paintCloseBackground(hwnd,dc); EndPaint(hwnd,&ps); return 0;
     }
     if(msg==WM_PRINTCLIENT) { paintCloseBackground(hwnd,(HDC)wp); return 0; }
-    if(msg==DM_GETDEFID) return MAKELONG(closeExitOnly?702:701,DC_HASDEFID);
+    if(msg==DM_GETDEFID) return MAKELONG(closeCallPrompt||closeSetupPrompt?IDCANCEL:closeExitOnly?702:701,DC_HASDEFID);
     if(msg==WM_LBUTTONDOWN&&GET_Y_LPARAM(lp)<(int)(54*GetDpiForWindow(hwnd)/96.f)) {
         POINT cursor; GetCursorPos(&cursor);
         ReleaseCapture(); SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,MAKELPARAM(cursor.x,cursor.y)); return 0;
@@ -1234,7 +1412,19 @@ LRESULT CALLBACK closeProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     }
     if(msg==WM_COMMAND) {
         int id=LOWORD(wp);
-        if(id==IDOK) id=closeExitOnly?702:701;
+        if(id==IDOK) id=closeCallPrompt||closeSetupPrompt?IDCANCEL:closeExitOnly?702:701;
+        if(closeCallPrompt||closeSetupPrompt) {
+            bool setup=closeSetupPrompt;
+            if(id==701||id==IDCANCEL||id==706) {
+                DestroyWindow(hwnd);
+                if(id==701) {
+                    if(diagnostic) ++diagnosticCallAccepts;
+                    else if(setup) beginAsrSetup();
+                    else if(!busy()) recordToggle();
+                }
+            }
+            return 0;
+        }
         if(id==701||id==702) {
             CloseAction choice=id==701?CloseAction::Tray:CloseAction::Exit;
             bool remember=!closeExitOnly&&IsDlgButtonChecked(hwnd,703)==BST_CHECKED;
@@ -1259,13 +1449,15 @@ LRESULT CALLBACK closeProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
-void showCloseChoice(bool exitOnly) {
+void showCloseChoice(bool exitOnly,const std::wstring& callName,bool setupPrompt) {
     if(closeDialog) { SetForegroundWindow(closeDialog); return; }
     expandDock();
-    closeExitOnly=exitOnly; closeIssue=false;
+    closeExitOnly=exitOnly; closeCallPrompt=!callName.empty(); closeSetupPrompt=setupPrompt;
+    closeCallName=callName; closeIssue=false;
     float scale=GetDpiForWindow(window)/96.f;
     closeScale=scale;
-    RECT bounds{0,0,(LONG)(424*scale),(LONG)((exitOnly?196:236)*scale)};
+    bool question=closeCallPrompt||closeSetupPrompt;
+    RECT bounds{0,0,(LONG)(424*scale),(LONG)((exitOnly||question?196:236)*scale)};
     DWORD style=WS_POPUP|WS_CLIPCHILDREN;
     RECT owner; GetWindowRect(window,&owner);
     MONITORINFO info{sizeof(info)}; GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&info);
@@ -1274,7 +1466,7 @@ void showCloseChoice(bool exitOnly) {
     LONG y=std::clamp((owner.top+owner.bottom-h)/2,info.rcWork.top,std::max(info.rcWork.top,info.rcWork.bottom-h));
     closeDialog=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED,L"LightRecClose",L"关闭全局录音",style,
         x,y,w,h,window,nullptr,GetModuleHandleW(nullptr),nullptr);
-    if(!closeDialog) { note=L"无法打开关闭选项，请使用菜单"; return; }
+    if(!closeDialog) { note=L"无法打开提示，请使用悬浮条"; return; }
     auto child=[&](const wchar_t* type,const wchar_t* label,DWORD flags,int id,int cx,int cy,int cw,int ch) {
         HWND item=CreateWindowExW(0,type,label,WS_CHILD|WS_VISIBLE|flags,
             (int)(cx*scale),(int)(cy*scale),(int)(cw*scale),(int)(ch*scale),
@@ -1282,23 +1474,33 @@ void showCloseChoice(bool exitOnly) {
         SendMessageW(item,WM_SETFONT,(WPARAM)closeFont,TRUE);
         SetWindowSubclass(item,closeControlProc,1,0);
     };
-    child(L"STATIC",L"关闭全局录音",0,700,22,18,380,25);
-    child(L"STATIC",exitOnly?L"停止并保存当前录音后退出？":L"收起到托盘，录音和转写会继续。",0,705,22,51,380,22);
-    child(L"STATIC",exitOnly?L"保存失败时会保留窗口并显示错误。":
+    std::wstring title=closeSetupPrompt?L"启用本地转写":closeCallPrompt?L"是否开始录音？":L"关闭全局录音";
+    std::wstring description=closeSetupPrompt?L"需要下载转写组件和多语言小模型，是否继续？":
+        closeCallPrompt?L"检测到 "+callName+L" 正在使用麦克风。":
+        exitOnly?L"停止并保存当前录音后退出？":L"收起到托盘，录音和转写会继续。";
+    SetWindowTextW(closeDialog,title.c_str());
+    child(L"STATIC",title.c_str(),0,700,22,18,380,25);
+    child(L"STATIC",description.c_str(),0,705,22,51,380,22);
+    child(L"STATIC",closeSetupPrompt?L"通过国内镜像下载，完成后离线转写。":
+        closeCallPrompt?L"语音消息也可能触发；确认后才开始录音。":
+        exitOnly?L"保存失败时会保留窗口并显示错误。":
           busy()||previewRecording?L"退出程序会先停止并保存当前录音。":L"退出程序将结束录音工具。",
           0,704,22,76,380,30);
     child(L"BUTTON",L"记住我的选择",BS_AUTOCHECKBOX|WS_TABSTOP,703,22,111,220,24);
-    child(L"BUTTON",L"最小化到托盘",BS_DEFPUSHBUTTON|WS_TABSTOP,701,22,157,145,31);
+    child(L"BUTTON",closeSetupPrompt?L"下载并启用":closeCallPrompt?L"开始录音":L"最小化到托盘",
+        (question?BS_PUSHBUTTON:BS_DEFPUSHBUTTON)|WS_TABSTOP,701,22,157,145,31);
     child(L"BUTTON",exitOnly?L"保存并退出":L"退出程序",BS_PUSHBUTTON|WS_TABSTOP,702,178,157,112,31);
-    child(L"BUTTON",L"取消",BS_PUSHBUTTON|WS_TABSTOP,IDCANCEL,302,157,100,31);
+    child(L"BUTTON",closeSetupPrompt?L"暂不下载":closeCallPrompt?L"暂不录制":L"取消",
+        (question?BS_DEFPUSHBUTTON:BS_PUSHBUTTON)|WS_TABSTOP,IDCANCEL,302,157,100,31);
     child(L"BUTTON",L"取消关闭",BS_PUSHBUTTON|WS_TABSTOP,706,368,15,32,32);
     layoutClose(closeDialog);
     if(exitOnly) { ShowWindow(GetDlgItem(closeDialog,701),SW_HIDE); ShowWindow(GetDlgItem(closeDialog,703),SW_HIDE); }
+    if(question) { ShowWindow(GetDlgItem(closeDialog,702),SW_HIDE); ShowWindow(GetDlgItem(closeDialog,703),SW_HIDE); }
     SetLayeredWindowAttributes(closeDialog,0,245,LWA_ALPHA);
     EnableWindow(window,FALSE);
     if(!diagnostic) {
         ShowWindow(closeDialog,SW_SHOW); SetForegroundWindow(closeDialog);
-        SetFocus(GetDlgItem(closeDialog,exitOnly?702:701));
+        SetFocus(GetDlgItem(closeDialog,question?IDCANCEL:exitOnly?702:701));
     }
 }
 bool renderClosePreview(const fs::path& path) {
@@ -1450,6 +1652,103 @@ bool dockWindowTest(const fs::path& target) {
         ",\"hiddenWindowOnly\":true,\"checks\":"+std::to_string(checks)+",\"failedChecks\":"+list+"}");
     return failed.empty()&&saved;
 }
+bool promptWindowTest(const fs::path& target) {
+    int checks=0; std::vector<int> failed;
+    auto expect=[&](bool value){++checks;if(!value)failed.push_back(checks);};
+    expect(callMode==1&&messagingCalls);
+    expect(messagingApp(L"C:\\Apps\\WeChat.exe")==CallApp::WeChat);
+    expect(messagingApp(L"C:\\Apps\\WEIXIN.EXE")==CallApp::WeChat);
+    expect(messagingApp(L"C:\\Apps\\QQ.exe")==CallApp::QQ);
+    expect(messagingApp(L"C:\\Apps\\QQNT.exe")==CallApp::QQ);
+    expect(messagingApp(L"C:\\Apps\\browser.exe")==CallApp::None);
+    expect(!watchedCallPath(L"C:\\Apps\\browser.exe",false,L"",true));
+    expect(watchedCallPath(L"C:\\Apps\\QQ.exe",false,L"",true));
+    expect(!watchedCallPath(L"C:\\Apps\\Weixin.exe",true,L"C:\\Apps\\QQ.exe",true));
+    expect(watchedCallPath(L"C:\\Apps\\qq.exe",true,L"C:\\Apps\\QQ.exe",true));
+    expect(watchedCallPath(L"C:\\Apps\\meeting.exe",false,L"",false));
+    CallGate gate;
+    expect(!gate.update(true,0)&&!gate.update(true,2000));
+    expect(gate.update(true,2500)&&!gate.update(true,2600));
+    expect(!gate.update(false,3000)&&!gate.update(true,4000));
+    expect(!gate.update(false,5000)&&!gate.update(false,13000));
+    expect(!gate.update(true,14000)&&gate.update(true,16500));
+    CallGate shortActivity;
+    expect(!shortActivity.update(true,0)&&!shortActivity.update(false,2000)&&
+        !shortActivity.update(true,2200)&&!shortActivity.update(true,4000));
+    diagnosticCallAccepts=0;
+    for(bool setup:{false,true}) {
+        showCloseChoice(false,setup?L"":L"微信",setup);
+        expect(closeDialog&&!IsWindowEnabled(window));
+        expect(SendMessageW(closeDialog,DM_GETDEFID,0,0)==MAKELONG(IDCANCEL,DC_HASDEFID));
+        expect(!(GetWindowLongPtrW(GetDlgItem(closeDialog,702),GWL_STYLE)&WS_VISIBLE)&&
+            !(GetWindowLongPtrW(GetDlgItem(closeDialog,703),GWL_STYLE)&WS_VISIBLE));
+        for(float scale:{1.f,1.25f,1.5f,2.f}) {
+            closeScale=scale;
+            SetWindowPos(closeDialog,nullptr,0,0,(int)(424*scale),(int)(196*scale),
+                SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+            layoutClose(closeDialog);
+            RECT client; GetClientRect(closeDialog,&client);
+            for(int id:{700,705,704,701,IDCANCEL,706}) {
+                RECT item; GetWindowRect(GetDlgItem(closeDialog,id),&item);
+                MapWindowPoints(nullptr,closeDialog,(POINT*)&item,2);
+                expect(item.left>=0&&item.top>=0&&item.right<=client.right&&item.bottom<=client.bottom);
+            }
+        }
+        closeScale=1.5f;
+        SetWindowPos(closeDialog,nullptr,0,0,636,294,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        layoutClose(closeDialog);
+        expect(renderClosePreview(target/(setup?L"setup-confirm.png":L"call-prompt.png")));
+        closeProc(closeDialog,WM_COMMAND,IDOK,0);
+        expect(!closeDialog&&diagnosticCallAccepts==0&&IsWindowEnabled(window));
+        showCloseChoice(false,setup?L"":L"QQ",setup);
+        closeProc(closeDialog,WM_COMMAND,706,0);
+        expect(!closeDialog&&diagnosticCallAccepts==0);
+    }
+    showCloseChoice(false,L"微信"); closeProc(closeDialog,WM_COMMAND,701,0);
+    expect(diagnosticCallAccepts==1&&!closeDialog&&!busy());
+    showCloseChoice(false,L"",true); closeProc(closeDialog,WM_COMMAND,701,0);
+    expect(diagnosticCallAccepts==2&&!setupProcess&&!enabled&&!asr);
+    std::string list="[";
+    for(size_t i=0;i<failed.size();++i){if(i)list+=",";list+=std::to_string(failed[i]);}
+    list+="]";
+    return atomicText(target/L"native-prompt-test.json",std::string("{\"passed\":")+
+        (failed.empty()?"true":"false")+",\"checks\":"+std::to_string(checks)+
+        ",\"noDevicesOrDownloads\":true,\"failedChecks\":"+list+"}")&&failed.empty();
+}
+bool animationRenderTest(const fs::path& target) {
+    dpi=2; dockEdge=DockEdge::Left; dockCollapsed=false; dockAnimating=false;
+    RECT area{}; SystemParametersInfoW(SPI_GETWORKAREA,0,&area,0); dockArea=area;
+    dockExpanded=dockBounds({area.left+50,area.top+80,area.left+50+(LONG)(W*dpi),
+        area.top+80+(LONG)(H*dpi)},area,dpi,dockEdge);
+    placeHud(dockExpanded);
+    LARGE_INTEGER frequency; QueryPerformanceFrequency(&frequency);
+    auto samples=[&](bool cached) {
+        std::vector<double> times;
+        for(int frame=0;frame<80;++frame) {
+            dockReveal=.05f+.9f*(frame/79.f);
+            LARGE_INTEGER start,end; QueryPerformanceCounter(&start);
+            redraw(); QueryPerformanceCounter(&end);
+            times.push_back(1000.0*(end.QuadPart-start.QuadPart)/frequency.QuadPart);
+        }
+        std::sort(times.begin(),times.end()); return times;
+    };
+    auto original=samples(false);
+    beginDockAnimation(true);
+    int allocations=hudSurface.allocations;
+    DWORD handles=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
+    auto cached=samples(true);
+    bool reused=hudSurface.allocations==allocations&&
+        GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS)<=handles+2;
+    diagnosticFrame=target/L"animation-cache-mid.png"; dockReveal=.5f; redraw();
+    stopDockTimer(); dockAnimating=false; dockScene.reset(); redraw();
+    std::ostringstream report;
+    report<<"{\"passed\":"<<(reused?"true":"false")<<",\"hiddenWindowOnly\":true,"
+        "\"dpiScale\":2,\"frames\":80,\"surfaceReused\":"<<(reused?"true":"false")
+        <<",\"fullPaintP50Ms\":"<<original[40]<<",\"fullPaintP95Ms\":"<<original[76]
+        <<",\"cachedP50Ms\":"<<cached[40]<<",\"cachedP95Ms\":"<<cached[76]
+        <<",\"realDesktopTiming\":false}";
+    return atomicText(target/L"native-animation-test.json",report.str())&&reused;
+}
 void command(int id) {
     struct Hold { Hold(){++interactionDepth; expandDock();} ~Hold(){--interactionDepth; outsideSince=0;} } hold;
     switch(id) {
@@ -1467,15 +1766,26 @@ void command(int id) {
         break;
     case ScopeGlobal:
         if(setting(L"program_only",L"0")) {
-            programOnly=false; callHits=0; callLatched=false;
+            programOnly=false; resetCallGates();
             note=busy()?L"已选择全局声音 · 下一次录音生效":L"已选择全局声音";
         }
         break;
     case ScopeProgram: chooseProgram(); break;
-    case Retry: enabled=true; paused=false; flags(); startAsr(true); break;
+    case Retry:
+        locateModel();
+        if(!localAsrReady()) showCloseChoice(false,L"",true);
+        else { enabled=true; paused=false; flags(); startAsr(true); }
+        break;
     case CallOff: case CallAsk: case CallAuto:
-        callMode=id-CallOff; callHits=0; callLatched=false;
-        setting(L"call_mode",std::to_wstring(callMode)); break;
+        if(setting(L"call_prompt_mode",std::to_wstring(id-CallOff))) {
+            callMode=id-CallOff; resetCallGates();
+        } else note=L"无法保存通话提醒设置";
+        break;
+    case MessagingCalls:
+        if(setting(L"call_watch_messaging",messagingCalls?L"0":L"1")) {
+            messagingCalls=!messagingCalls; resetCallGates();
+        } else note=L"无法保存提醒范围";
+        break;
     case ExitApp:
         if(closeDialog) DestroyWindow(closeDialog);
         requestExit(); break;
@@ -1503,7 +1813,9 @@ void menu() {
     AppendMenuW(calls,MF_STRING|(callMode==0?MF_CHECKED:0),CallOff,L"关闭");
     AppendMenuW(calls,MF_STRING|(callMode==1?MF_CHECKED:0),CallAsk,L"检测后询问");
     AppendMenuW(calls,MF_STRING|(callMode==2?MF_CHECKED:0),CallAuto,L"检测后自动录音");
-    AppendMenuW(m,MF_POPUP,(UINT_PTR)calls,L"麦克风活动自动录音（实验）");
+    AppendMenuW(calls,MF_SEPARATOR,0,nullptr);
+    AppendMenuW(calls,MF_STRING|(messagingCalls?MF_CHECKED:0),MessagingCalls,L"仅提醒 QQ 和微信");
+    AppendMenuW(m,MF_POPUP,(UINT_PTR)calls,L"通话录音提醒（实验）");
     AppendMenuW(m,MF_STRING,HideWindow,L"收起到托盘");
     AppendMenuW(m,MF_STRING,ShowWindowCmd,L"显示悬浮条");
     AppendMenuW(m,MF_SEPARATOR,0,nullptr);
@@ -1538,7 +1850,9 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             if(shouldCollapse(dockCollapsed,held,inside,now,outsideSince)) collapseDock(true);
             return 0;
         }
-        pollAsr();
+        // Keep disk queues, process startup and audio-session enumeration out of animation frames.
+        if(dockAnimating) return 0;
+        pollAsrSetup(); pollAsr();
         static auto previous=lightrec::CaptureState::Idle;
         auto current=recorder.state();
         if(current!=previous) {
@@ -1551,7 +1865,7 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         }
         static int ticks=0; ++ticks;
         if(ticks%4==0) { if(!diagnostic) { startAsr(); refreshTray(); } if(expanded) updateText(); }
-        if(ticks%8==0) checkCall();
+        if(ticks%4==0) checkCall();
         redraw();
         if(benchTicks && ticks>=benchTicks) DestroyWindow(hwnd);
         return 0;
@@ -1587,7 +1901,7 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         if(diagnostic) return 0;
         if(h==6) { pressed=h; SetCapture(hwnd); redraw(); return 0; }
         if(h==0) recordToggle();
-        if(h==1) { enabled=!enabled; if(enabled) paused=false; flags(); note.clear(); startAsr(); }
+        if(h==1) toggleTranscription();
         if(h==2 && enabled) { paused=!paused; flags(); note.clear(); if(!paused) startAsr(); }
         if(h==3) menu();
         if(h==4) chooseFolder();
@@ -1647,7 +1961,7 @@ LRESULT CALLBACK proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             placeHud(dragOrigin);
         } else {
             bool collapsed=dockCollapsed||(dockAnimating&&dockHiding);
-            KillTimer(hwnd,3); dockAnimating=dockCollapsed=false; dockReveal=1;
+            stopDockTimer(); dockScene.reset(); dockAnimating=dockCollapsed=false; dockReveal=1;
             RECT rect{r->left,r->top,r->left+(LONG)(W*dpi),r->top+(LONG)(H*dpi)};
             if(dockEdge!=DockEdge::None) {
                 MONITORINFO info{sizeof(info)};
@@ -1696,7 +2010,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     int argc=0; auto argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     std::wstring mode=argc>1?argv[1]:L"";
     diagnostic=mode==L"--render"||mode==L"--benchmark"||mode==L"--self-test"||mode==L"--config-test"||
-        mode==L"--window-test"||mode==L"--export-icons"||mode==L"--shell-test"||mode==L"--dock-test";
+        mode==L"--window-test"||mode==L"--export-icons"||mode==L"--shell-test"||mode==L"--dock-test"||
+        mode==L"--prompt-test"||mode==L"--animation-test";
     int result=0;
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     GdiplusStartupInput input; GdiplusStartup(&gdipToken,&input,nullptr);
@@ -1913,7 +2228,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
                 if(!session.empty()&&std::find(sessionQueue.begin(),sessionQueue.end(),session)==sessionQueue.end())
                     sessionQueue.push_back(session);
             }
-            callMode=std::clamp(GetPrivateProfileIntW(L"recorder",L"call_mode",0,config.c_str()),0u,2u);
+            callMode=std::clamp(GetPrivateProfileIntW(L"recorder",L"call_prompt_mode",1,config.c_str()),0u,2u);
+            messagingCalls=GetPrivateProfileIntW(L"recorder",L"call_watch_messaging",1,config.c_str())!=0;
             flags();
         } else if(mode==L"--benchmark") benchTicks=argc>2?std::max(8,_wtoi(argv[2])*4):80;
         appLargeIcon=lightrec::makeRecorderIcon(64,false);
@@ -1967,9 +2283,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
                     }
                 }
             }
-            if(mode==L"--dock-test") {
+            if(mode==L"--dock-test"||mode==L"--prompt-test"||mode==L"--animation-test") {
                 fs::path target=argc>2?fs::path(argv[2]):project/L"work";
-                result=dockWindowTest(target)?0:1; DestroyWindow(window);
+                bool ok=mode==L"--dock-test"?dockWindowTest(target):
+                    mode==L"--prompt-test"?promptWindowTest(target):animationRenderTest(target);
+                result=ok?0:1; DestroyWindow(window);
             } else {
                 redraw(); ShowWindow(window,diagnostic||background?SW_HIDE:SW_SHOWNOACTIVATE);
                 SetTimer(window,1,250,nullptr);
@@ -1984,6 +2302,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     }
     if(asr) CloseHandle(asr);
     if(asrJob) CloseHandle(asrJob);
+    if(setupProcess) CloseHandle(setupProcess);
+    if(setupJob) CloseHandle(setupJob);
+    stopDockTimer(); dockScene.reset(); hudSurface.release();
     if(instanceMutex) CloseHandle(instanceMutex);
     for(HICON icon:{appLargeIcon,appSmallIcon,trayIdleIcon,trayRecordingIcon}) if(icon) DestroyIcon(icon);
     LocalFree(argv); GdiplusShutdown(gdipToken); CoUninitialize();
