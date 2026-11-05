@@ -449,10 +449,15 @@ function Invoke-AsrSetup {
         $stage = '检查本地模型'
         Write-AsrStatus $StatusPath running $stage
         $model = ''
-        foreach ($candidate in @($ExistingModel, $old['model'])) {
+        if ($ExistingModel) {
+            if (!(Test-AsrModelLoad $python $ExistingModel $StatusPath)) {
+                throw '所选本地模型无法加载，请更换完整模型目录；未下载替代模型'
+            }
+            $model = [IO.Path]::GetFullPath($ExistingModel)
+        } else {
+            $candidate = $old['model']
             if ($candidate -and (Test-AsrModelLoad $python $candidate $StatusPath)) {
                 $model = [IO.Path]::GetFullPath($candidate)
-                break
             }
         }
         if (!$model) {

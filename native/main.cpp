@@ -36,7 +36,7 @@ const Color accent(255,194,225,222), danger(255,244,117,118);
 }
 enum { Folder = 101, OpenFolder, ShowText, HideWindow, ExitApp,
        CallOff, CallAsk, CallAuto, Retry, ShowWindowCmd, ScopeGlobal, ScopeProgram, EditHotkeys, ToggleStartup,
-       ResetCloseAction, MessagingCalls };
+       ResetCloseAction, MessagingCalls, SelectModel };
 HWND window = nullptr, transcript = nullptr, edit = nullptr;
 fs::path project, config, root, session, activeRoot, model, python;
 fs::path diagnosticFrame;
@@ -125,6 +125,7 @@ void showCloseChoice(bool exitOnly=false,const std::wstring& callName=L"",bool s
 void resetCallGates();
 void beginAsrSetup();
 void toggleTranscription();
+bool chooseModelFolder();
 
 std::vector<Program> runningPrograms() {
     std::vector<Program> result;
@@ -340,6 +341,70 @@ void chunkReady(const lightrec::Chunk& c) {
 bool localAsrReady() {
     return !python.empty()&&fs::exists(python)&&!model.empty()&&
         fs::exists(model/L"model.bin")&&fs::exists(model/L"config.json");
+}
+bool modelFolderReady(const fs::path& folder) {
+    auto nonempty=[&](const wchar_t* name) {
+        std::error_code ec;
+        fs::path file=folder/name;
+        if(!fs::is_regular_file(file,ec)||ec) return false;
+        auto size=fs::file_size(file,ec);
+        return !ec&&size>0;
+    };
+    return !folder.empty()&&nonempty(L"model.bin")&&nonempty(L"config.json")&&
+        nonempty(L"tokenizer.json")&&(nonempty(L"vocabulary.txt")||nonempty(L"vocabulary.json"));
+}
+bool selectModelFolder(const fs::path& selected,std::wstring& issue) {
+    if(setupProcess) { issue=L"正在安装转写组件，请完成后再更换模型。"; return false; }
+    pollAsr();
+    if(enabled||asr) {
+        issue=L"请先关闭转写，当前分段完成后再更换模型。"; return false;
+    }
+    if(!modelFolderReady(selected)) {
+        issue=L"请选择含 model.bin、配置和词表的完整模型目录。"; return false;
+    }
+    if(!setting(L"asr_model",selected.wstring())) {
+        issue=L"模型位置无法保存，原设置已保留。"; return false;
+    }
+    model=selected; issue.clear(); return true;
+}
+bool chooseModelFolder() {
+    if(diagnostic) return false;
+    pollAsr();
+    if(setupProcess||enabled||asr) {
+        note=L"请先关闭转写，等待当前分段或安装完成后再选择模型"; return false;
+    }
+    IFileOpenDialog* dialog=nullptr;
+    if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog)))) {
+        note=L"无法打开模型文件夹选择器"; return false;
+    }
+    DWORD opts=0; dialog->GetOptions(&opts);
+    dialog->SetOptions(opts|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST|FOS_NOCHANGEDIR);
+    dialog->SetTitle(L"选择完整的 faster-whisper 模型文件夹（含 model.bin）");
+    IShellItem* initial=nullptr;
+    if(!model.empty()&&SUCCEEDED(SHCreateItemFromParsingName(model.c_str(),nullptr,IID_PPV_ARGS(&initial)))) {
+        dialog->SetFolder(initial); initial->Release();
+    }
+    bool selected=false;
+    ++interactionDepth;
+    if(SUCCEEDED(dialog->Show(closeDialog?closeDialog:window))) {
+        IShellItem* item=nullptr;
+        if(SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR name=nullptr;
+            if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&name))) {
+                std::wstring issue;
+                selected=selectModelFolder(fs::path(name),issue);
+                CoTaskMemFree(name);
+                note=selected?L"模型位置已记住 · 直接使用原文件":issue;
+                if(!selected&&closeDialog) {
+                    closeIssue=true; SetDlgItemTextW(closeDialog,704,issue.c_str());
+                }
+            }
+            item->Release();
+        }
+    }
+    --interactionDepth; outsideSince=0;
+    dialog->Release(); return selected;
 }
 void beginAsrSetup() {
     if(diagnostic) return;
@@ -1298,7 +1363,7 @@ void paintCloseControl(HWND hwnd,HDC dc,bool hovered,bool forceFocus=false) {
     wchar_t label[256]{}; GetWindowTextW(hwnd,label,256);
     int id=GetDlgCtrlID(hwnd); bool focused=forceFocus||GetFocus()==hwnd;
     bool pushed=(SendMessageW(hwnd,BM_GETSTATE,0,0)&BST_PUSHED)!=0;
-    if(id==700||id==704||id==705) {
+    if(id==700||id==704||id==705||id==707) {
         text(g,label,0,0,w,h,id==700?17.f:id==705?12.f:11.f,
             id==700?ui::primary:(id==704&&closeIssue?ui::danger:ui::secondary),ui::font,id==700);
         return;
@@ -1322,7 +1387,7 @@ void paintCloseControl(HWND hwnd,HDC dc,bool hovered,bool forceFocus=false) {
         g.DrawLine(&cross,w/2-4,h/2-4,w/2+4,h/2+4);
         g.DrawLine(&cross,w/2+4,h/2-4,w/2-4,h/2+4);
     } else {
-        bool danger=id==702;
+        bool danger=id==702&&!closeSetupPrompt;
         bool primary=id==701;
         Color ink=danger?ui::danger:primary?ui::accent:ui::secondary;
         Color fill=danger?Color(pushed?65:hovered?45:20,244,117,118):
@@ -1343,7 +1408,7 @@ void paintCloseControl(HWND hwnd,HDC dc,bool hovered,bool forceFocus=false) {
 }
 LRESULT CALLBACK closeControlProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR state) {
     if(msg==WM_NCHITTEST&&GetDlgCtrlID(hwnd)==700) return HTTRANSPARENT;
-    if(msg==WM_SETCURSOR&&GetDlgCtrlID(hwnd)!=700&&GetDlgCtrlID(hwnd)!=704&&GetDlgCtrlID(hwnd)!=705) {
+    if(msg==WM_SETCURSOR&&GetDlgCtrlID(hwnd)!=700&&GetDlgCtrlID(hwnd)!=704&&GetDlgCtrlID(hwnd)!=705&&GetDlgCtrlID(hwnd)!=707) {
         SetCursor(LoadCursorW(nullptr,IDC_HAND)); return TRUE;
     }
     if(msg==WM_ERASEBKGND) return 1;
@@ -1371,13 +1436,13 @@ void layoutClose(HWND hwnd) {
     float scale=closeScale;
     struct Item { int id,x,y,w,h; };
     const Item items[]={{700,56,19,300,30},{705,24,64,376,23},{704,24,88,376,24},
-        {703,24,124,260,28},{701,24,176,162,40},{702,198,176,112,40},
+        {703,24,124,260,28},{707,24,120,376,32},{701,24,176,162,40},{702,198,176,112,40},
         {IDCANCEL,322,176,78,40},{706,368,15,32,32}};
     HFONT next=CreateFontW(-(int)(14*scale),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
     for(const auto& item:items) {
         HWND child=GetDlgItem(hwnd,item.id);
-        bool question=closeCallPrompt||closeSetupPrompt;
+        bool question=closeCallPrompt;
         int y=(closeExitOnly&&(item.id==702||item.id==IDCANCEL))||
             (question&&(item.id==701||item.id==IDCANCEL))?136:item.y;
         int x=question&&item.id==IDCANCEL?264:item.x;
@@ -1415,6 +1480,13 @@ LRESULT CALLBACK closeProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         if(id==IDOK) id=closeCallPrompt||closeSetupPrompt?IDCANCEL:closeExitOnly?702:701;
         if(closeCallPrompt||closeSetupPrompt) {
             bool setup=closeSetupPrompt;
+            if(setup&&id==702) {
+                if(chooseModelFolder()) {
+                    DestroyWindow(hwnd);
+                    toggleTranscription();
+                }
+                return 0;
+            }
             if(id==701||id==IDCANCEL||id==706) {
                 DestroyWindow(hwnd);
                 if(id==701) {
@@ -1457,7 +1529,7 @@ void showCloseChoice(bool exitOnly,const std::wstring& callName,bool setupPrompt
     float scale=GetDpiForWindow(window)/96.f;
     closeScale=scale;
     bool question=closeCallPrompt||closeSetupPrompt;
-    RECT bounds{0,0,(LONG)(424*scale),(LONG)((exitOnly||question?196:236)*scale)};
+    RECT bounds{0,0,(LONG)(424*scale),(LONG)((exitOnly||closeCallPrompt?196:236)*scale)};
     DWORD style=WS_POPUP|WS_CLIPCHILDREN;
     RECT owner; GetWindowRect(window,&owner);
     MONITORINFO info{sizeof(info)}; GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&info);
@@ -1475,27 +1547,40 @@ void showCloseChoice(bool exitOnly,const std::wstring& callName,bool setupPrompt
         SetWindowSubclass(item,closeControlProc,1,0);
     };
     std::wstring title=closeSetupPrompt?L"启用本地转写":closeCallPrompt?L"是否开始录音？":L"关闭全局录音";
-    std::wstring description=closeSetupPrompt?L"需要下载转写组件和多语言小模型，是否继续？":
+    bool existingModel=!model.empty();
+    std::wstring description=closeSetupPrompt?(existingModel?
+        L"已找到本地模型，仅需准备转写运行环境。":
+        L"缺少转写组件，可下载或选择已有模型。"):
         closeCallPrompt?L"检测到 "+callName+L" 正在使用麦克风。":
         exitOnly?L"停止并保存当前录音后退出？":L"收起到托盘，录音和转写会继续。";
     SetWindowTextW(closeDialog,title.c_str());
     child(L"STATIC",title.c_str(),0,700,22,18,380,25);
     child(L"STATIC",description.c_str(),0,705,22,51,380,22);
-    child(L"STATIC",closeSetupPrompt?L"通过国内镜像下载，完成后离线转写。":
+    child(L"STATIC",closeSetupPrompt?(existingModel?
+        L"仅下载运行组件，不复制或重复下载模型。":
+        L"国内镜像按需下载，已有模型可直接复用。"):
         closeCallPrompt?L"语音消息也可能触发；确认后才开始录音。":
         exitOnly?L"保存失败时会保留窗口并显示错误。":
           busy()||previewRecording?L"退出程序会先停止并保存当前录音。":L"退出程序将结束录音工具。",
           0,704,22,76,380,30);
     child(L"BUTTON",L"记住我的选择",BS_AUTOCHECKBOX|WS_TABSTOP,703,22,111,220,24);
-    child(L"BUTTON",closeSetupPrompt?L"下载并启用":closeCallPrompt?L"开始录音":L"最小化到托盘",
+    std::wstring modelLabel=existingModel?L"模型："+model.filename().wstring():L"支持完整的 faster-whisper / CTranslate2 模型目录";
+    if(modelLabel.size()>40) modelLabel=modelLabel.substr(0,37)+L"…";
+    child(L"STATIC",modelLabel.c_str(),0,707,24,120,376,32);
+    child(L"BUTTON",closeSetupPrompt?(existingModel?L"安装环境并启用":L"下载并启用"):closeCallPrompt?L"开始录音":L"最小化到托盘",
         (question?BS_PUSHBUTTON:BS_DEFPUSHBUTTON)|WS_TABSTOP,701,22,157,145,31);
-    child(L"BUTTON",exitOnly?L"保存并退出":L"退出程序",BS_PUSHBUTTON|WS_TABSTOP,702,178,157,112,31);
-    child(L"BUTTON",closeSetupPrompt?L"暂不下载":closeCallPrompt?L"暂不录制":L"取消",
+    child(L"BUTTON",closeSetupPrompt?(existingModel?L"更换模型…":L"选择已有模型"):exitOnly?L"保存并退出":L"退出程序",
+        BS_PUSHBUTTON|WS_TABSTOP,702,178,157,112,31);
+    child(L"BUTTON",closeSetupPrompt?L"暂不启用":closeCallPrompt?L"暂不录制":L"取消",
         (question?BS_DEFPUSHBUTTON:BS_PUSHBUTTON)|WS_TABSTOP,IDCANCEL,302,157,100,31);
     child(L"BUTTON",L"取消关闭",BS_PUSHBUTTON|WS_TABSTOP,706,368,15,32,32);
     layoutClose(closeDialog);
     if(exitOnly) { ShowWindow(GetDlgItem(closeDialog,701),SW_HIDE); ShowWindow(GetDlgItem(closeDialog,703),SW_HIDE); }
-    if(question) { ShowWindow(GetDlgItem(closeDialog,702),SW_HIDE); ShowWindow(GetDlgItem(closeDialog,703),SW_HIDE); }
+    if(question) {
+        if(!closeSetupPrompt) ShowWindow(GetDlgItem(closeDialog,702),SW_HIDE);
+        ShowWindow(GetDlgItem(closeDialog,703),SW_HIDE);
+    }
+    if(!closeSetupPrompt) ShowWindow(GetDlgItem(closeDialog,707),SW_HIDE);
     SetLayeredWindowAttributes(closeDialog,0,245,LWA_ALPHA);
     EnableWindow(window,FALSE);
     if(!diagnostic) {
@@ -1510,7 +1595,7 @@ bool renderClosePreview(const fs::path& path) {
     HGDIOBJ previous=SelectObject(memory,dib);
     // Render our own hidden native children, avoiding non-client offsets and desktop capture.
     paintCloseBackground(closeDialog,memory);
-    for(int id:{700,705,704,703,701,702,IDCANCEL,706}) {
+    for(int id:{700,705,704,707,703,701,702,IDCANCEL,706}) {
         HWND child=GetDlgItem(closeDialog,id);
         if(!(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)) continue;
         RECT bounds; GetWindowRect(child,&bounds);
@@ -1680,11 +1765,15 @@ bool promptWindowTest(const fs::path& target) {
         showCloseChoice(false,setup?L"":L"微信",setup);
         expect(closeDialog&&!IsWindowEnabled(window));
         expect(SendMessageW(closeDialog,DM_GETDEFID,0,0)==MAKELONG(IDCANCEL,DC_HASDEFID));
-        expect(!(GetWindowLongPtrW(GetDlgItem(closeDialog,702),GWL_STYLE)&WS_VISIBLE)&&
+        expect(((GetWindowLongPtrW(GetDlgItem(closeDialog,702),GWL_STYLE)&WS_VISIBLE)!=0)==setup&&
             !(GetWindowLongPtrW(GetDlgItem(closeDialog,703),GWL_STYLE)&WS_VISIBLE));
+        if(setup) {
+            closeProc(closeDialog,WM_COMMAND,702,0);
+            expect(closeDialog&&!setupProcess&&!enabled); // Diagnostics never open the real picker.
+        }
         for(float scale:{1.f,1.25f,1.5f,2.f}) {
             closeScale=scale;
-            SetWindowPos(closeDialog,nullptr,0,0,(int)(424*scale),(int)(196*scale),
+            SetWindowPos(closeDialog,nullptr,0,0,(int)(424*scale),(int)((setup?236:196)*scale),
                 SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
             layoutClose(closeDialog);
             RECT client; GetClientRect(closeDialog,&client);
@@ -1693,9 +1782,17 @@ bool promptWindowTest(const fs::path& target) {
                 MapWindowPoints(nullptr,closeDialog,(POINT*)&item,2);
                 expect(item.left>=0&&item.top>=0&&item.right<=client.right&&item.bottom<=client.bottom);
             }
+            if(setup) {
+                RECT choose,download,cancel,detail;
+                GetWindowRect(GetDlgItem(closeDialog,702),&choose);
+                GetWindowRect(GetDlgItem(closeDialog,701),&download);
+                GetWindowRect(GetDlgItem(closeDialog,IDCANCEL),&cancel);
+                GetWindowRect(GetDlgItem(closeDialog,707),&detail);
+                expect(download.right<choose.left&&choose.right<cancel.left&&detail.bottom<choose.top);
+            }
         }
         closeScale=1.5f;
-        SetWindowPos(closeDialog,nullptr,0,0,636,294,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        SetWindowPos(closeDialog,nullptr,0,0,636,setup?354:294,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
         layoutClose(closeDialog);
         expect(renderClosePreview(target/(setup?L"setup-confirm.png":L"call-prompt.png")));
         closeProc(closeDialog,WM_COMMAND,IDOK,0);
@@ -1708,6 +1805,45 @@ bool promptWindowTest(const fs::path& target) {
     expect(diagnosticCallAccepts==1&&!closeDialog&&!busy());
     showCloseChoice(false,L"",true); closeProc(closeDialog,WM_COMMAND,701,0);
     expect(diagnosticCallAccepts==2&&!setupProcess&&!enabled&&!asr);
+    // Synthetic model directories only: persist the exact external path without copying weights.
+    fs::path oldConfig=config,oldProject=project,oldModel=model,oldPython=python;
+    config=fs::absolute(target)/L"model-selection.ini";
+    project=fs::absolute(target);
+    auto fixture=project/L"已有模型 中文 with spaces";
+    fs::create_directories(fixture);
+    for(auto name:{L"model.bin",L"config.json",L"tokenizer.json",L"vocabulary.txt"})
+        std::ofstream(fixture/name)<< (std::wstring(name)==L"model.bin"?"synthetic":"{}");
+    std::wstring issue;
+    auto size=fs::file_size(fixture/L"model.bin");
+    expect(modelFolderReady(fixture)&&!modelFolderReady(fixture/L"missing"));
+    expect(selectModelFolder(fixture,issue)&&issue.empty()&&model==fixture);
+    expect(ini(L"asr_model")==fixture.wstring());
+    expect(fs::file_size(fixture/L"model.bin")==size&&!fs::exists(project/L"models"));
+    expect(!selectModelFolder(fixture/L"missing",issue)&&model==fixture&&ini(L"asr_model")==fixture.wstring());
+    fs::remove(fixture/L"vocabulary.txt");
+    expect(!modelFolderReady(fixture));
+    std::ofstream(fixture/L"vocabulary.json")<<"[\"token\"]";
+    expect(modelFolderReady(fixture));
+    { std::ofstream(fixture/L"model.bin",std::ios::trunc); }
+    expect(!modelFolderReady(fixture));
+    std::ofstream(fixture/L"model.bin")<<"synthetic";
+    enabled=true;
+    expect(!selectModelFolder(fixture,issue)&&!issue.empty());
+    enabled=false;
+    setting(L"asr_python",L"missing/python.exe"); locateModel();
+    expect(model==fixture&&!localAsrReady());
+    showCloseChoice(false,L"",true);
+    wchar_t label[128]{};
+    GetWindowTextW(GetDlgItem(closeDialog,701),label,128);
+    expect(std::wstring(label)==L"安装环境并启用");
+    expect(renderClosePreview(target/L"setup-existing-model.png"));
+    closeProc(closeDialog,WM_COMMAND,IDCANCEL,0);
+    fs::path validConfig=config;
+    config=fixture/L"nonexistent-parent/settings.ini";
+    expect(!selectModelFolder(fixture,issue)&&model==fixture);
+    config=validConfig;
+    locateModel(); expect(model==fixture); // Reload persisted absolute path.
+    config=oldConfig; project=oldProject; model=oldModel; python=oldPython;
     std::string list="[";
     for(size_t i=0;i<failed.size();++i){if(i)list+=",";list+=std::to_string(failed[i]);}
     list+="]";
@@ -1753,6 +1889,7 @@ void command(int id) {
     struct Hold { Hold(){++interactionDepth; expandDock();} ~Hold(){--interactionDepth; outsideSince=0;} } hold;
     switch(id) {
     case Folder: chooseFolder(); break;
+    case SelectModel: chooseModelFolder(); break;
     case OpenFolder:
         ShellExecuteW(window,L"open",(session.empty()?root:session).c_str(),nullptr,nullptr,SW_SHOWNORMAL); break;
     case ShowText: showText(); break;
@@ -1802,6 +1939,7 @@ void menu() {
     AppendMenuW(m,MF_STRING,Folder,L"选择录音保存文件夹…");
     AppendMenuW(m,MF_STRING,OpenFolder,L"打开录音文件夹");
     AppendMenuW(m,MF_STRING,ShowText,L"查看转写正文");
+    AppendMenuW(m,MF_STRING,SelectModel,L"选择已有模型文件夹…");
     AppendMenuW(m,MF_STRING,Retry,L"重试本次未完成转写");
     AppendMenuW(m,MF_STRING,EditHotkeys,L"快捷键设置…");
     AppendMenuW(m,MF_STRING|(closeAction==CloseAction::Ask?MF_GRAYED:0),ResetCloseAction,L"恢复关闭时询问");

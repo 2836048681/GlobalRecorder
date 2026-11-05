@@ -2,7 +2,7 @@
   "date": "2026-11-05",
   "platform": "Windows x86_64",
   "compiler": "Zig 0.15.2",
-  "binarySha256": "0B5D4A249567923787F3C0E2E81EE0CCF965831B35FE206B335835098CF24706",
+  "binarySha256": "6EC0C3E3F4E5C82869D931E6E6D1F87A9A71FFDF00F28DA321CC525308F64C62",
   "nativeModes": [
     {
       "exit": 0,
@@ -47,7 +47,7 @@
   },
   "prompts": {
     "passed": true,
-    "checks": 79,
+    "checks": 98,
     "noDevicesOrDownloads": true,
     "failedChecks": []
   },
@@ -57,17 +57,18 @@
     "dpiScale": 2,
     "frames": 80,
     "surfaceReused": true,
-    "fullPaintP50Ms": 2.6905,
-    "fullPaintP95Ms": 4.0102,
-    "cachedP50Ms": 0.6714,
-    "cachedP95Ms": 1.0621,
+    "fullPaintP50Ms": 2.4487,
+    "fullPaintP95Ms": 3.1134,
+    "cachedP50Ms": 0.5969,
+    "cachedP95Ms": 0.8233,
     "realDesktopTiming": false
   },
   "memory": {
-    "privateMiB": 3.316,
+    "workingSetMiB": 15.188,
+    "privateMiB": 3.293,
+    "samples": 31,
     "mode": "hidden idle; no audio, model or downloads",
-    "workingSetMiB": 15.227,
-    "samples": 31
+    "exit": 0
   },
   "asrBridgeTests": {
     "audioDevices": false,
@@ -82,10 +83,20 @@
   "realInstallerEndToEnd": "NOT_RUN",
   "asrInstallerOfflineTests": {
     "realDownloads": false,
-    "assertions": 148,
+    "assertions": 152,
     "realInstallation": false,
     "windowsPowerShellVersion": "5.1",
-    "cases": 28,
+    "cases": 29,
     "failed": 0
+  },
+  "version": "v0.2.1",
+  "localModelSelection": {
+    "syntheticFilesOnly": true,
+    "absolutePathPersists": true,
+    "invalidOrUnwritableKeepsPrevious": true,
+    "supportsVocabularyTxtOrJson": true,
+    "modelWeightsCopied": false,
+    "explicitModelFailureDownloadsReplacement": false,
+    "realFolderPickerInteraction": "NOT_RUN"
   }
 }

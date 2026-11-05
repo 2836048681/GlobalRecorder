@@ -303,6 +303,24 @@ try {
         Assert-Asr ((Invoke-AsrSetup $dir $ready) -ne 0) 'collision accepted'
         Assert-Asr ([IO.File]::ReadAllText($ready).StartsWith('[asr]')) 'error handler overwrote ready'
     }
+    Test-Case 'Explicit local model failure never downloads a replacement or overwrites ready' {
+        $dir=New-TestDirectory
+        $python=Join-Path $dir 'python.exe'
+        [IO.File]::WriteAllText($python,'synthetic')
+        $model=Join-Path $dir 'existing model'
+        [IO.Directory]::CreateDirectory($model)|Out-Null
+        $ready=Join-Path $dir 'runtime\asr-ready.ini'
+        Write-AsrAtomicText $ready "[asr]`r`npython=old`r`nmodel=old`r`n"
+        $script:replacementDownloads=0
+        function Test-AsrPython { return $true }
+        function Test-AsrModelLoad { return $false }
+        function Install-AsrModel { $script:replacementDownloads++; throw 'unexpected model download' }
+        $status=Join-Path $dir 'status.ini'
+        Assert-Asr ((Invoke-AsrSetup $dir $status $python $model) -ne 0) 'broken explicit model accepted'
+        Assert-Asr ($script:replacementDownloads -eq 0) 'model download consent expanded'
+        Assert-Asr ((Get-AsrReadyValues $ready)['model'] -eq 'old') 'old ready changed'
+        Assert-Asr ([IO.File]::ReadAllText($status).Contains('未下载替代模型')) 'actionable error missing'
+    }
     Test-Case 'Process pipes, Windows escaping and parent environment isolation' {
         $parent=$env:PYTHONPATH; $env:PYTHONPATH='parent-sentinel'
         $code='[Console]::Out.Write((''x'' * 100000)); [Console]::Error.Write((''e'' * 100000)); if ($env:PYTHONPATH) { exit 99 }; exit 7'
